@@ -1,17 +1,24 @@
-import pytest
+"""
+Tests common to psycopg.AsyncCursor and its subclasses.
+"""
+
 import weakref
 import datetime as dt
 from typing import List
+from contextlib import aclosing
+
+import pytest
 
 import psycopg
 from psycopg import sql, rows
 from psycopg.adapt import PyFormat
 from psycopg.types import TypeInfo
 
-from .utils import alist, gc_collect, raiseif
-from .test_cursor import my_row_factory, ph
-from .test_cursor import execmany, _execmany  # noqa: F401
+from .utils import alist, anext
+from .utils import gc_collect, raiseif
 from .fix_crdb import crdb_encoding
+from ._test_cursor import my_row_factory, ph
+from ._test_cursor import execmany, _execmany  # noqa: F401
 
 execmany = execmany  # avoid F811 underneath
 
@@ -19,7 +26,7 @@ execmany = execmany  # avoid F811 underneath
 @pytest.fixture(
     params=[psycopg.AsyncCursor, psycopg.AsyncClientCursor, psycopg.AsyncRawCursor]
 )
-def aconn(aconn, request, anyio_backend):
+async def aconn(aconn, request, anyio_backend):
     aconn.cursor_factory = request.param
     return aconn
 
@@ -459,13 +466,12 @@ async def test_rownumber_none(aconn, query):
 
 async def test_rownumber_mixed(aconn):
     cur = aconn.cursor()
-    await cur.execute(
-        """
-select x from generate_series(1, 3) x;
-set timezone to utc;
-select x from generate_series(4, 6) x;
-"""
-    )
+    queries = [
+        "select x from generate_series(1, 3) x",
+        "set timezone to utc",
+        "select x from generate_series(4, 6) x",
+    ]
+    await cur.execute(";\n".join(queries))
     assert cur.rownumber == 0
     assert await cur.fetchone() == (1,)
     assert cur.rownumber == 1
@@ -497,8 +503,7 @@ async def test_iter_stop(aconn):
         break
 
     assert (await cur.fetchone()) == (3,)
-    async for rec in cur:
-        assert False
+    assert (await alist(cur)) == []
 
 
 async def test_row_factory(aconn):
@@ -635,22 +640,22 @@ async def test_stream_sql(aconn):
 
 async def test_stream_row_factory(aconn):
     cur = aconn.cursor(row_factory=rows.dict_row)
-    ait = cur.stream("select generate_series(1,2) as a")
-    assert (await ait.__anext__())["a"] == 1
+    it = cur.stream("select generate_series(1,2) as a")
+    assert (await anext(it))["a"] == 1
     cur.row_factory = rows.namedtuple_row
-    assert (await ait.__anext__()).a == 2
+    assert (await anext(it)).a == 2
 
 
 async def test_stream_no_row(aconn):
     cur = aconn.cursor()
-    recs = [rec async for rec in cur.stream("select generate_series(2,1) as a")]
+    recs = await alist(cur.stream("select generate_series(2,1) as a"))
     assert recs == []
 
 
 @pytest.mark.crdb_skip("no col query")
 async def test_stream_no_col(aconn):
     cur = aconn.cursor()
-    recs = [rec async for rec in cur.stream("select")]
+    recs = await alist(cur.stream("select"))
     assert recs == [()]
 
 
@@ -689,11 +694,9 @@ async def test_stream_error_notx(aconn):
 async def test_stream_error_python_to_consume(aconn):
     cur = aconn.cursor()
     with pytest.raises(ZeroDivisionError):
-        gen = cur.stream("select generate_series(1, 10000)")
-        async for rec in gen:
-            1 / 0
-
-    await gen.aclose()
+        async with aclosing(cur.stream("select generate_series(1, 10000)")) as gen:
+            async for rec in gen:
+                1 / 0
     assert aconn.info.transaction_status in (
         aconn.TransactionStatus.INTRANS,
         aconn.TransactionStatus.INERROR,
