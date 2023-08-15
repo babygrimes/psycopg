@@ -392,3 +392,47 @@ if __name__ == '__main__':
     env["PYTHONFAULTHANDLER"] = "1"
     out = sp.check_output([sys.executable, "-s", "-c", script], env=env)
     assert out.decode().rstrip() == "[1, 1]"
+
+
+@pytest.mark.parametrize("what", ["commit", "rollback", "error"])
+def test_transaction_concurrency(conn, what):
+    conn.autocommit = True
+
+    evs = [threading.Event() for i in range(3)]
+
+    def worker(unlock, wait_on):
+        with pytest.raises(e.ProgrammingError) as ex:
+            with conn.transaction():
+                unlock.set()
+                wait_on.wait()
+                conn.execute("select 1")
+
+                if what == "error":
+                    1 / 0
+                elif what == "rollback":
+                    raise psycopg.Rollback()
+                else:
+                    assert what == "commit"
+
+        if what == "error":
+            assert "transaction rollback" in str(ex.value)
+            assert isinstance(ex.value.__context__, ZeroDivisionError)
+        elif what == "rollback":
+            assert "transaction rollback" in str(ex.value)
+            assert isinstance(ex.value.__context__, psycopg.Rollback)
+        else:
+            assert "transaction commit" in str(ex.value)
+
+    # Start a first transaction in a thread
+    t1 = threading.Thread(target=worker, kwargs={"unlock": evs[0], "wait_on": evs[1]})
+    t1.start()
+    evs[0].wait()
+
+    # Start a nested transaction in a thread
+    t2 = threading.Thread(target=worker, kwargs={"unlock": evs[1], "wait_on": evs[2]})
+    t2.start()
+
+    # Terminate the first transaction before the second does
+    t1.join()
+    evs[2].set()
+    t2.join()
